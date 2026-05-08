@@ -1132,8 +1132,8 @@ impl PackPruneCmd {
         let mut total_freed: u64 = 0;
         let mut total_removed: usize = 0;
 
-        // Clean pack sidecar cache
-        if let Some(base) = dirs::cache_dir() {
+        // Clean pack sidecar cache (honors SMOLVM_PACK_CACHE_DIR via cache_root).
+        if let Ok(base) = smolvm_pack::extract::cache_root() {
             let pack_cache = base.join("smolvm-pack");
             let (freed, removed) = self.prune_cache_dir(&pack_cache, keep, "pack cache")?;
             total_freed += freed;

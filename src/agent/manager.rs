@@ -180,13 +180,49 @@ pub fn vm_data_dir(name: &str) -> PathBuf {
     vm_cache_root().join(vm_dir_hash(name))
 }
 
-/// Cache root: `<cache_dir>/smolvm/vms/`.
-pub fn vm_cache_root() -> PathBuf {
+/// Default VM cache root: `<cache_dir>/smolvm/vms/`. No env consulted.
+pub fn vm_cache_root_default() -> PathBuf {
     dirs::cache_dir()
         .or_else(dirs::data_local_dir)
         .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join("smolvm")
         .join("vms")
+}
+
+/// Resolved VM cache root: `SMOLVM_VM_CACHE_DIR` if set (taken verbatim,
+/// no `smolvm/vms` suffix appended), else [`vm_cache_root_default`].
+///
+/// Used by jailer-style sandboxes that place per-VM state on a
+/// dedicated writable mount.
+pub fn vm_cache_root() -> PathBuf {
+    if let Some(dir) = std::env::var("SMOLVM_VM_CACHE_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
+        return PathBuf::from(dir);
+    }
+    vm_cache_root_default()
+}
+
+/// Default ephemeral-VM runtime dir: `<runtime_dir>/smolvm`
+/// (or `<cache>/smolvm` if no runtime dir). No env consulted.
+fn ephemeral_runtime_default() -> PathBuf {
+    dirs::runtime_dir()
+        .or_else(dirs::cache_dir)
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join("smolvm")
+}
+
+/// Resolved ephemeral-VM runtime dir: `SMOLVM_RUNTIME_DIR` if set,
+/// else [`ephemeral_runtime_default`].
+fn ephemeral_runtime_resolved() -> PathBuf {
+    if let Some(dir) = std::env::var("SMOLVM_RUNTIME_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
+        return PathBuf::from(dir);
+    }
+    ephemeral_runtime_default()
 }
 
 /// Compute the 16-hex-char directory name for a VM.
@@ -349,10 +385,7 @@ impl AgentManager {
         let smolvm_runtime = if let Some(ref vm_name) = name {
             vm_data_dir(vm_name)
         } else {
-            dirs::runtime_dir()
-                .or_else(dirs::cache_dir)
-                .unwrap_or_else(|| PathBuf::from("/tmp"))
-                .join("smolvm")
+            ephemeral_runtime_resolved()
         };
         std::fs::create_dir_all(&smolvm_runtime)?;
 
