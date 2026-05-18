@@ -20,8 +20,8 @@ use std::time::Duration;
 
 /// SQLite busy_timeout: how long a blocked writer waits for the write lock
 /// before returning SQLITE_BUSY. Set high enough to survive burst contention
-/// from concurrent CLI processes (e.g., 20 VMs starting simultaneously).
-const BUSY_TIMEOUT: Duration = Duration::from_secs(30);
+/// from concurrent CLI processes (e.g., 10-20 VMs starting simultaneously).
+const BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Extension trait to convert errors into `Error::database`.
 trait DbResultExt<T> {

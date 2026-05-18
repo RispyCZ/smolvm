@@ -382,13 +382,17 @@ impl AgentClient {
             |e| {
                 // Check if this is a transient error worth retrying
                 let error_msg = e.to_string();
-                // Connection refused/reset are transient during VM startup
+                // Connection refused/reset are transient during VM startup.
+                // "No such file or directory" occurs when the vsock socket
+                // file hasn't been created yet by libkrun's muxer thread —
+                // transient under concurrent boot contention.
                 error_msg.contains("Connection refused")
                     || error_msg.contains("connection refused")
                     || error_msg.contains("Connection reset")
                     || error_msg.contains("connection reset")
                     || error_msg.contains("Broken pipe")
                     || error_msg.contains("Resource temporarily unavailable")
+                    || error_msg.contains("No such file or directory")
             },
         )
     }

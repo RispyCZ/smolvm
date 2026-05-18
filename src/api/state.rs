@@ -36,11 +36,6 @@ pub struct MachineEntry {
     pub restart: RestartConfig,
     /// Whether outbound network access is enabled.
     pub network: bool,
-    /// Per-VM operation lock. Serializes start/stop/exec within the API server
-    /// process to prevent concurrent operations on the same VM (e.g., two
-    /// simultaneous start requests racing to spawn the same VM). Uses
-    /// std::sync::Mutex because it's held across sync I/O, not async awaits.
-    pub op_lock: Arc<std::sync::Mutex<()>>,
 }
 
 /// Parameters for registering a new machine.
@@ -243,7 +238,6 @@ impl ApiState {
                             resources,
                             restart: record.restart.clone(),
                             network: record.network,
-                            op_lock: Arc::new(std::sync::Mutex::new(())),
                         })),
                     );
                     loaded.push(name.clone());
@@ -494,7 +488,6 @@ impl ApiState {
                         resources: reg.resources,
                         restart: reg.restart,
                         network: reg.network,
-                        op_lock: Arc::new(std::sync::Mutex::new(())),
                     })),
                 );
                 Ok(())

@@ -131,7 +131,6 @@ fn machine_entry_from_record(record: &VmRecord, manager: AgentManager) -> Machin
         resources: vm_resources_to_spec(record.vm_resources()),
         restart: record.restart.clone(),
         network: record.network,
-        op_lock: Arc::new(std::sync::Mutex::new(())),
     }
 }
 
