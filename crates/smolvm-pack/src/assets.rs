@@ -12,6 +12,25 @@ use std::path::{Path, PathBuf};
 use crate::format::{AssetEntry, AssetInventory, LayerEntry};
 use crate::{PackError, Result};
 
+/// Convert a digest string to a short filename for layer tars.
+///
+/// Expects `sha256:<64-hex-chars>` format. Returns error if the digest
+/// portion (after prefix strip) is shorter than 12 characters.
+fn digest_to_filename(digest: &str) -> Result<String> {
+    let short = digest.strip_prefix("sha256:").unwrap_or(digest);
+    if short.len() < 12 {
+        return Err(PackError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "digest too short for filename: '{}' ({} chars, need 12)",
+                digest,
+                short.len()
+            ),
+        )));
+    }
+    Ok(format!("{}.tar", &short[..12]))
+}
+
 /// Compression level for zstd (3 = zstd default, fast with good ratio).
 /// Level 19 was ~100x slower for only ~10% better compression.
 pub const ZSTD_LEVEL: i32 = 3;
@@ -209,9 +228,7 @@ impl AssetCollector {
 
     /// Add an OCI layer tarball.
     pub fn add_layer(&mut self, digest: &str, layer_data: &[u8]) -> Result<()> {
-        // Create filename from digest (remove sha256: prefix)
-        let short_digest = digest.strip_prefix("sha256:").unwrap_or(digest);
-        let filename = format!("{}.tar", &short_digest[..12]);
+        let filename = digest_to_filename(digest)?;
         let path = format!("layers/{}", filename);
 
         let dst = self.staging_dir.join(&path);
@@ -231,8 +248,7 @@ impl AssetCollector {
     /// Call this before streaming the layer to get the destination path,
     /// then call `register_layer()` after writing to register it in the inventory.
     pub fn layer_staging_path(&self, digest: &str) -> PathBuf {
-        let short_digest = digest.strip_prefix("sha256:").unwrap_or(digest);
-        let filename = format!("{}.tar", &short_digest[..12]);
+        let filename = digest_to_filename(digest).unwrap_or_else(|_| format!("{}.tar", digest));
         self.staging_dir.join(format!("layers/{}", filename))
     }
 
@@ -240,8 +256,7 @@ impl AssetCollector {
     ///
     /// Use after streaming a layer directly to `layer_staging_path()`.
     pub fn register_layer(&mut self, digest: &str) -> Result<()> {
-        let short_digest = digest.strip_prefix("sha256:").unwrap_or(digest);
-        let filename = format!("{}.tar", &short_digest[..12]);
+        let filename = digest_to_filename(digest)?;
         let path = format!("layers/{}", filename);
         let dst = self.staging_dir.join(&path);
 
@@ -257,8 +272,7 @@ impl AssetCollector {
 
     /// Add an OCI layer from a file path.
     pub fn add_layer_from_file(&mut self, digest: &str, layer_path: &Path) -> Result<()> {
-        let short_digest = digest.strip_prefix("sha256:").unwrap_or(digest);
-        let filename = format!("{}.tar", &short_digest[..12]);
+        let filename = digest_to_filename(digest)?;
         let path = format!("layers/{}", filename);
 
         let dst = self.staging_dir.join(&path);

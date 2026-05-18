@@ -38,7 +38,19 @@ fn safe_unpack<R: Read>(archive: &mut tar::Archive<R>, dest: &Path) -> std::io::
         let entry_path = entry.path()?.to_path_buf();
 
         match entry_type {
-            tar::EntryType::Regular | tar::EntryType::GNUSparse | tar::EntryType::Directory => {}
+            tar::EntryType::Regular
+            | tar::EntryType::GNUSparse
+            | tar::EntryType::Directory
+            | tar::EntryType::Continuous => {}
+            // GNU/PAX extension headers are metadata for the next entry.
+            // The tar crate normally consumes them internally, but some
+            // archives surface them as explicit entries. Skip them.
+            tar::EntryType::GNULongName
+            | tar::EntryType::GNULongLink
+            | tar::EntryType::XGlobalHeader
+            | tar::EntryType::XHeader => {
+                continue;
+            }
             tar::EntryType::Symlink => {
                 // Allow symlinks but validate the target stays within dest.
                 if let Some(link_target) = entry.link_name()? {
@@ -87,22 +99,21 @@ fn safe_unpack<R: Read>(archive: &mut tar::Archive<R>, dest: &Path) -> std::io::
                     }
                 }
             }
-            tar::EntryType::Char | tar::EntryType::Block => {
-                // Device nodes appear in overlayfs upper-layer exports from
-                // Debian-based images (e.g., update-alternatives creates char
-                // entries in /etc/alternatives/). These cannot be created
-                // without root and aren't needed on the host — skip them.
+            tar::EntryType::Char | tar::EntryType::Block | tar::EntryType::Fifo => {
+                // Device nodes and FIFOs appear in overlayfs upper-layer
+                // exports (e.g., whiteout char devices from package upgrades,
+                // named pipes from certain RPM scriptlets). These cannot be
+                // created without root on macOS and aren't needed on the
+                // host — skip them.
                 continue;
             }
-            other => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!(
-                        "tar entry '{}' has disallowed type {:?}",
-                        entry_path.display(),
-                        other
-                    ),
-                ));
+            _other => {
+                // Unknown or unsupported entry types (sockets, vendor
+                // extensions, future tar formats). Skip rather than fail —
+                // the packed image runs inside a Linux VM where the agent
+                // rootfs provides these files; missing non-regular entries
+                // on the host extraction side don't affect functionality.
+                continue;
             }
         }
 
@@ -136,7 +147,19 @@ fn safe_unpack<R: Read>(archive: &mut tar::Archive<R>, dest: &Path) -> std::io::
             }
         }
 
-        entry.unpack_in(dest)?;
+        if let Err(e) = entry.unpack_in(dest) {
+            // On macOS, certain entries fail to unpack due to platform
+            // limitations (xattr encoding, uid/gid mapping, resource forks).
+            // For non-Regular entries (symlinks, hardlinks, dirs), skip and
+            // continue rather than aborting the entire extraction.
+            if entry_type != tar::EntryType::Regular && entry_type != tar::EntryType::GNUSparse {
+                continue;
+            }
+            return Err(std::io::Error::new(
+                e.kind(),
+                format!("failed to unpack '{}': {}", entry_path.display(), e),
+            ));
+        }
 
         // After extracting a directory, force it writable so subsequent
         // entries (children) can be created inside it. Final permissions
@@ -1557,34 +1580,6 @@ mod tests {
     }
 
     #[test]
-    fn test_safe_unpack_rejects_disallowed_entry_type() {
-        // Build a tar with a FIFO entry (disallowed type)
-        let temp_dir = tempfile::tempdir().unwrap();
-        let dest_raw = temp_dir.path().join("out");
-        fs::create_dir_all(&dest_raw).unwrap();
-        let dest = dest_raw.canonicalize().unwrap();
-
-        let mut builder = tar::Builder::new(Vec::new());
-        let mut header = tar::Header::new_gnu();
-        header.set_entry_type(tar::EntryType::Fifo);
-        header.set_size(0);
-        header.set_mode(0o644);
-        header.set_cksum();
-        builder
-            .append_data(&mut header, "fifo-entry", &b""[..])
-            .unwrap();
-        let tar_data = builder.into_inner().unwrap();
-
-        let mut archive = tar::Archive::new(tar_data.as_slice());
-        let result = safe_unpack(&mut archive, &dest);
-        assert!(result.is_err(), "FIFO entry type should be rejected");
-        assert!(
-            result.unwrap_err().to_string().contains("disallowed type"),
-            "error should mention disallowed type"
-        );
-    }
-
-    #[test]
     fn test_safe_unpack_skips_char_and_block_devices() {
         // Char/Block entries appear in overlayfs exports from Debian images
         // (e.g., update-alternatives). They should be skipped, not rejected.
@@ -1804,5 +1799,206 @@ mod tests {
                 & 0o777;
             assert_eq!(mode, 0o555, "deferred directory mode should be 555");
         }
+    }
+
+    #[test]
+    fn test_safe_unpack_mixed_fedora_overlay_layer() {
+        // Realistic Fedora overlay layer: regular files interspersed with
+        // whiteout char devices and hardlinks to those whiteouts.
+        // All good files should extract; bad entries should be skipped.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dest_raw = temp_dir.path().join("out");
+        fs::create_dir_all(&dest_raw).unwrap();
+        let dest = dest_raw.canonicalize().unwrap();
+
+        let mut builder = tar::Builder::new(Vec::new());
+
+        // Directory
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Directory);
+        header.set_size(0);
+        header.set_mode(0o755);
+        header.set_path("usr/").unwrap();
+        header.set_cksum();
+        builder.append_data(&mut header, "usr/", &b""[..]).unwrap();
+
+        // Good file 1
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_size(11);
+        header.set_mode(0o644);
+        header.set_path("usr/good1.txt").unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "usr/good1.txt", &b"good file 1"[..])
+            .unwrap();
+
+        // Char device whiteout
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Char);
+        header.set_size(0);
+        header.set_mode(0o000);
+        header.set_device_major(0).unwrap();
+        header.set_device_minor(0).unwrap();
+        header.set_path("usr/.wh.removed-pkg").unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "usr/.wh.removed-pkg", &b""[..])
+            .unwrap();
+
+        // Good file 2
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_size(11);
+        header.set_mode(0o644);
+        header.set_path("usr/good2.txt").unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "usr/good2.txt", &b"good file 2"[..])
+            .unwrap();
+
+        // Hardlink to the whiteout (should be skipped)
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Link);
+        header.set_size(0);
+        header.set_mode(0o000);
+        header.set_path("usr/link-to-removed").unwrap();
+        header.set_link_name("usr/.wh.removed-pkg").unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "usr/link-to-removed", &b""[..])
+            .unwrap();
+
+        // Good file 3
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_size(11);
+        header.set_mode(0o755);
+        header.set_path("usr/good3.sh").unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "usr/good3.sh", &b"#!/bin/bash"[..])
+            .unwrap();
+
+        // Another char device whiteout
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Char);
+        header.set_size(0);
+        header.set_mode(0o000);
+        header.set_device_major(0).unwrap();
+        header.set_device_minor(0).unwrap();
+        header.set_path("usr/.wh.another-removed").unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "usr/.wh.another-removed", &b""[..])
+            .unwrap();
+
+        // Good file 4 (final entry)
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_size(5);
+        header.set_mode(0o644);
+        header.set_path("usr/good4.dat").unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "usr/good4.dat", &b"final"[..])
+            .unwrap();
+
+        let tar_data = builder.into_inner().unwrap();
+
+        let mut archive = tar::Archive::new(tar_data.as_slice());
+        let result = safe_unpack(&mut archive, &dest);
+        assert!(
+            result.is_ok(),
+            "mixed Fedora overlay should extract cleanly: {:?}",
+            result.err()
+        );
+
+        // Good files are all extracted
+        assert_eq!(
+            fs::read_to_string(dest.join("usr/good1.txt")).unwrap(),
+            "good file 1"
+        );
+        assert_eq!(
+            fs::read_to_string(dest.join("usr/good2.txt")).unwrap(),
+            "good file 2"
+        );
+        assert_eq!(
+            fs::read_to_string(dest.join("usr/good3.sh")).unwrap(),
+            "#!/bin/bash"
+        );
+        assert_eq!(
+            fs::read_to_string(dest.join("usr/good4.dat")).unwrap(),
+            "final"
+        );
+
+        // Bad entries are not created
+        assert!(!dest.join("usr/.wh.removed-pkg").exists());
+        assert!(!dest.join("usr/link-to-removed").exists());
+        assert!(!dest.join("usr/.wh.another-removed").exists());
+    }
+
+    #[test]
+    fn test_safe_unpack_unknown_tar_type_byte() {
+        // Entry with unknown tar type byte (0x41 = 'A') — a vendor extension
+        // not recognized by the tar crate (maps to __Nonexhaustive).
+        // Should be skipped gracefully by safe_unpack's catch-all arm.
+        // Note: byte '7' maps to EntryType::Continuous which is allowed.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dest_raw = temp_dir.path().join("out");
+        fs::create_dir_all(&dest_raw).unwrap();
+        let dest = dest_raw.canonicalize().unwrap();
+
+        let mut builder = tar::Builder::new(Vec::new());
+
+        // Regular file before the unknown entry
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_size(6);
+        header.set_mode(0o644);
+        header.set_path("before.txt").unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "before.txt", &b"before"[..])
+            .unwrap();
+
+        // Unknown type byte entry ('A' = 0x41, truly unrecognized)
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::new(b'A'));
+        header.set_size(0);
+        header.set_mode(0o644);
+        header.set_path("unknown-type-entry").unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "unknown-type-entry", &b""[..])
+            .unwrap();
+
+        // Regular file after
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_size(5);
+        header.set_mode(0o644);
+        header.set_path("after.txt").unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "after.txt", &b"after"[..])
+            .unwrap();
+
+        let tar_data = builder.into_inner().unwrap();
+
+        let mut archive = tar::Archive::new(tar_data.as_slice());
+        let result = safe_unpack(&mut archive, &dest);
+        assert!(
+            result.is_ok(),
+            "unknown tar type should be skipped: {:?}",
+            result.err()
+        );
+
+        assert_eq!(
+            fs::read_to_string(dest.join("before.txt")).unwrap(),
+            "before"
+        );
+        assert_eq!(fs::read_to_string(dest.join("after.txt")).unwrap(), "after");
+        assert!(!dest.join("unknown-type-entry").exists());
     }
 }
