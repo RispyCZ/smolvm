@@ -18,6 +18,7 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod guest_env;
 pub mod retry;
 
 /// Serde helper for encoding `Vec<u8>` as a base64 string in JSON.
@@ -91,6 +92,16 @@ pub const FILE_WRITE_CHUNK_SIZE: usize = FILE_WRITE_SINGLE_SHOT_MAX;
 /// and the `gpu_vram_mib` cap. Callers that need to move larger
 /// blobs should stage via a virtiofs mount instead of `cp`.
 pub const FILE_TRANSFER_MAX_TOTAL: u64 = 4 * 1024 * 1024 * 1024;
+
+/// Filename of the virtiofs-visible marker the agent creates when it is
+/// ready to accept vsock connections.
+///
+/// The host polls for this file through its virtiofs mount of the guest
+/// rootfs. The agent writes it (and optionally a symlink from `/oldroot/`)
+/// during deferred init, just before opening the vsock listener.
+///
+/// Both sides must agree on this name; keeping it here prevents silent drift.
+pub const AGENT_READY_MARKER: &str = ".smolvm-ready";
 
 /// Well-known vsock ports.
 pub mod ports {

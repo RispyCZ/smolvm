@@ -12,7 +12,7 @@ use crate::crun::CrunCommand;
 use crate::oci::{generate_container_id, OciSpec};
 use crate::paths;
 use crate::process::{WaitResult, TIMEOUT_EXIT_CODE};
-use smolvm_network::guest_env;
+use smolvm_protocol::guest_env;
 use smolvm_protocol::{ImageInfo, OverlayInfo, RegistryAuth, StorageStatus};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -154,9 +154,11 @@ fn ensure_mount_target_under_root(rootfs: &Path, container_path: &str) -> Result
     })?;
 
     let relative = validate_container_destination_path(container_path)?;
+    let components: Vec<_> = relative.components().collect();
+    let last_idx = components.len().saturating_sub(1);
     let mut current = root_canon.clone();
 
-    for component in relative.components() {
+    for (idx, component) in components.into_iter().enumerate() {
         let std::path::Component::Normal(seg) = component else {
             return Err(StorageError::ValidationFailed {
                 context: "mount destination".to_string(),
@@ -178,9 +180,31 @@ fn ensure_mount_target_under_root(rootfs: &Path, container_path: &str) -> Result
                             reason: "resolved path escapes rootfs".to_string(),
                         });
                     }
-                }
-
-                if !meta.is_dir() {
+                    if idx == last_idx {
+                        // The mount target itself is a symlink within the rootfs.
+                        // Previous VM runs can leave such symlinks (e.g. /workspace →
+                        // /storage/workspace) in the writable agent rootfs. Replace it
+                        // with a real directory so the bind mount claims the path
+                        // directly rather than following through to the symlink target.
+                        std::fs::remove_file(&current).map_err(|e| StorageError::ReadFile {
+                            path: current.display().to_string(),
+                            cause: format!("failed to remove symlink at mount target: {}", e),
+                        })?;
+                        std::fs::create_dir(&current).map_err(|err| StorageError::CreateDir {
+                            path: current.display().to_string(),
+                            cause: err.to_string(),
+                        })?;
+                    } else if !current.is_dir() {
+                        // Intermediate symlink must resolve to a directory.
+                        return Err(StorageError::ValidationFailed {
+                            context: "mount destination".to_string(),
+                            reason: format!(
+                                "destination component is not a directory: {}",
+                                current.display()
+                            ),
+                        });
+                    }
+                } else if !meta.is_dir() {
                     return Err(StorageError::ValidationFailed {
                         context: "mount destination".to_string(),
                         reason: format!(
@@ -3146,5 +3170,37 @@ mod tests {
 
         symlink(outside.path(), rootfs.join("link-out")).unwrap();
         assert!(ensure_mount_target_under_root(&rootfs, "/link-out/dir").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_ensure_mount_target_under_root_replaces_intra_rootfs_symlink_with_dir() {
+        use std::os::unix::fs::symlink;
+
+        // Simulates the agent-rootfs having a pre-baked /workspace symlink from
+        // a previous VM run (via virtiofs write-through). The function must
+        // replace it with a real directory so the bind mount can claim the path.
+        let root = tempfile::tempdir().unwrap();
+        let rootfs = root.path().join("rootfs");
+        let target_dir = rootfs.join("storage").join("workspace");
+        std::fs::create_dir_all(&target_dir).unwrap();
+
+        // /workspace → /storage/workspace (relative to rootfs) — symlink within rootfs
+        let workspace_link = rootfs.join("workspace");
+        symlink(&target_dir, &workspace_link).unwrap();
+        assert!(workspace_link.is_symlink());
+
+        let result = ensure_mount_target_under_root(&rootfs, "/workspace");
+        assert!(result.is_ok(), "expected Ok, got {:?}", result);
+
+        // The symlink must have been replaced with a real directory.
+        assert!(
+            !workspace_link.is_symlink(),
+            "/workspace should no longer be a symlink"
+        );
+        assert!(
+            workspace_link.is_dir(),
+            "/workspace should now be a directory"
+        );
     }
 }

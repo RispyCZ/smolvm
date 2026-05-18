@@ -9,8 +9,8 @@
 //! Communication is via vsock on port 6000.
 
 use smolvm_protocol::{
-    error_codes, ports, AgentRequest, AgentResponse, Envelope, RegistryAuth, LAYER_CHUNK_SIZE,
-    PROTOCOL_VERSION,
+    error_codes, guest_env, ports, AgentRequest, AgentResponse, Envelope, RegistryAuth,
+    AGENT_READY_MARKER, LAYER_CHUNK_SIZE, PROTOCOL_VERSION,
 };
 use std::io::{Read, Write};
 use std::os::unix::io::AsRawFd;
@@ -58,7 +58,14 @@ fn format_boot_log(level: &str, msg: &str) -> String {
 /// Write a structured JSON log line to stderr during early boot,
 /// before tracing_subscriber is initialized. This keeps
 /// agent-console.log as valid JSON throughout.
-/// Also writes to /dev/kmsg so messages appear in dmesg.
+/// Also mirrors to /dev/kmsg so messages appear in `dmesg` inside the VM.
+///
+/// These timing lines (`boot agent_entry`, `mounts_done`, `rootfs_done`, etc.)
+/// are intentionally permanent support logs — they are not gated on RUST_LOG
+/// because they run before the tracing subscriber exists. Output goes only to
+/// `agent-console.log` (readable via `~/Library/Caches/smolvm/vms/<id>/`) and
+/// the in-VM kernel ring buffer, neither of which is visible to end users in
+/// normal operation.
 fn boot_log(level: &str, msg: &str) {
     let line = format_boot_log(level, msg);
     eprintln!("{}", line);
@@ -107,19 +114,6 @@ const NETWORK_TEST_TIMEOUT_SECS: u64 = 10;
 /// Poll interval for checking process completion in VM exec.
 const PROCESS_POLL_INTERVAL_MS: u64 = 10;
 
-/// Env var the host sets on guest init to signal GPU was requested.
-///
-/// This literal must match `smolvm::data::consts::ENV_SMOLVM_GPU` on
-/// the host. The agent crate does not depend on the host crate, so we
-/// redeclare the string here; a unit test on the host
-/// (`agent_env_constants_match`) asserts the two are in sync so a
-/// rename on one side can't silently desync the other.
-const ENV_SMOLVM_GPU: &str = "SMOLVM_GPU";
-
-/// Value signaling "on" for boolean SMOLVM_* sentinel env vars.
-/// Matches `smolvm::data::consts::ENV_VALUE_ON`.
-const ENV_VALUE_ON: &str = "1";
-
 /// Get system uptime in milliseconds (for timing relative to boot).
 fn uptime_ms() -> u64 {
     if let Ok(contents) = std::fs::read_to_string("/proc/uptime") {
@@ -132,6 +126,19 @@ fn uptime_ms() -> u64 {
     0
 }
 
+/// Get uptime via CLOCK_BOOTTIME syscall — works before /proc is mounted.
+#[cfg(target_os = "linux")]
+fn boottime_ms() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    unsafe {
+        libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut ts);
+    }
+    (ts.tv_sec as u64) * 1000 + (ts.tv_nsec as u64) / 1_000_000
+}
+
 fn main() {
     // Quick --version check (used by init script to detect rootfs updates)
     if std::env::args().any(|a| a == "--version") {
@@ -139,21 +146,37 @@ fn main() {
         std::process::exit(0);
     }
 
+    // Earliest possible timing point — CLOCK_BOOTTIME works before /proc exists.
+    #[cfg(target_os = "linux")]
+    boot_log(
+        "INFO",
+        &format!("boot agent_entry uptime_ms={}", boottime_ms()),
+    );
+
     // CRITICAL: Mount essential filesystems FIRST, before anything else.
     // When running as init (PID 1), we need these for the system to function.
     // This must happen before logging (which needs /dev for output).
     mount_essential_filesystems();
+    boot_log(
+        "INFO",
+        &format!("boot mounts_done uptime_ms={}", uptime_ms()),
+    );
 
-    // Create /dev/dri device nodes if virtio-gpu is present.
-    // libkrun's init.c mounts /dev as a basic tmpfs, so DRM nodes are not
-    // auto-created by devtmpfs. We read major:minor from /sys/class/drm/ and
-    // mknod them so containers can access the GPU render node.
+    // Create /dev/dri device nodes only when GPU is enabled. The setup
+    // function polls up to 500ms for the virtio-gpu driver to finish probing —
+    // running it on non-GPU machines wastes the full polling window.
     #[cfg(target_os = "linux")]
-    setup_gpu_dev_nodes();
+    if std::env::var(guest_env::GPU).as_deref() == Ok(guest_env::VALUE_ON) {
+        setup_gpu_dev_nodes();
+    }
 
     // Set up persistent rootfs overlay (if /dev/vdb exists).
     // This does overlayfs + pivot_root before anything else touches the filesystem.
     setup_persistent_rootfs();
+    boot_log(
+        "INFO",
+        &format!("boot rootfs_done uptime_ms={}", uptime_ms()),
+    );
 
     // Start seatd AFTER pivot_root so its socket lands at /run/seatd.sock in
     // the live root. Wayland compositors (Weston, sway) and DRI3-capable X
@@ -161,7 +184,7 @@ fn main() {
     // devices. Without seatd, GPU-accelerated display workloads fail with
     // "No backend was able to open a seat."
     #[cfg(target_os = "linux")]
-    if std::env::var(ENV_SMOLVM_GPU).as_deref() == Ok(ENV_VALUE_ON) {
+    if std::env::var(guest_env::GPU).as_deref() == Ok(guest_env::VALUE_ON) {
         start_seatd();
     }
 
@@ -175,6 +198,10 @@ fn main() {
             std::process::exit(1);
         }
     };
+    boot_log(
+        "INFO",
+        &format!("boot vsock_bound uptime_ms={}", uptime_ms()),
+    );
 
     // Set up signal handlers for graceful shutdown (sync before exit)
     setup_signal_handlers();
@@ -184,6 +211,10 @@ fn main() {
     // That connection takes ~10-30ms, giving us time to finish deferred init
     // below before the first request arrives.
     signal_ready_to_host();
+    boot_log(
+        "INFO",
+        &format!("boot ready_sent uptime_ms={}", uptime_ms()),
+    );
 
     // --- Deferred init: runs while host is detecting marker + connecting ---
     // Storage mount is behind a OnceLock (ensure_storage_mounted) so it
@@ -302,7 +333,7 @@ fn main() {
     // the missing GPU much later — when their workload makes a
     // rendering call and crashes with a confused EGL/Vulkan error.
     #[cfg(target_os = "linux")]
-    if std::env::var(ENV_SMOLVM_GPU).as_deref() == Ok(ENV_VALUE_ON) {
+    if std::env::var(guest_env::GPU).as_deref() == Ok(guest_env::VALUE_ON) {
         log_gpu_status();
     }
 
@@ -319,20 +350,11 @@ fn main() {
     }
 }
 
-/// Well-known filename for the ready marker.
-/// The agent creates this file in the virtiofs rootfs to signal readiness.
-/// The host watches for it via inotify/kqueue instead of the vsock socket.
-const READY_MARKER_FILENAME: &str = ".smolvm-ready";
-
 /// Signal to the host that the agent is fully initialized and ready.
 ///
-/// Creates a marker file in the virtiofs rootfs directory. Since virtiofs is
-/// shared between host and guest, the host can detect this file instantly
-/// via inotify/kqueue. This is more reliable than watching the vsock socket
-/// file (which is created by libkrun's muxer thread before the agent boots).
-///
-/// After pivot_root, the virtiofs root is mounted at /oldroot.
-/// Without overlay, the virtiofs root is /.
+/// Writes a marker file to the virtiofs rootfs. The host polls for this file.
+/// The virtiofs FUSE write is visible on the host filesystem within ~1ms
+/// (hv_gic_set_spi interrupt injection is 0–15µs; no event_manager involvement).
 fn signal_ready_to_host() {
     use std::path::Path;
 
@@ -341,14 +363,14 @@ fn signal_ready_to_host() {
     // Try /oldroot first (overlay mode: virtiofs is the lower layer after pivot_root)
     // Before pivot_root: virtiofs is at /, so the / path works.
     let paths = [
-        format!("/oldroot/{}", READY_MARKER_FILENAME),
-        format!("/{}", READY_MARKER_FILENAME),
+        format!("/oldroot/{}", AGENT_READY_MARKER),
+        format!("/{}", AGENT_READY_MARKER),
     ];
 
     for path in &paths {
         if Path::new(path).parent().map_or(false, |p| p.exists()) {
             if std::fs::write(path, content.as_bytes()).is_ok() {
-                debug!(path = path, "ready marker written");
+                boot_log("INFO", &format!("ready marker written: {path}"));
                 return;
             }
         }
@@ -627,7 +649,7 @@ fn start_seatd() {
 
 /// Log whether the GPU is accessible in the guest.
 ///
-/// Called at startup when `ENV_SMOLVM_GPU` is set. Checks whether the virtio-gpu
+/// Called at startup when `guest_env::GPU` is set. Checks whether the virtio-gpu
 /// render node appeared in `/dev/dri/` after `setup_gpu_dev_nodes` ran. If not,
 /// the kernel was built without `virtio-gpu` or `drm` support and the workload
 /// will fail at Vulkan/EGL init rather than here — log a clear warning so the
@@ -728,6 +750,57 @@ fn setup_persistent_rootfs() {
 
     let _ = std::fs::create_dir_all(OVERLAY_MOUNT);
 
+    // Probe and mount storage disk in parallel with the overlay ext4 operations.
+    // Spawning here (before the /dev/vdb ext4 mount) lets storage work overlap
+    // with both the virtiofs activity between probe and mount (~27ms gap) and
+    // the /dev/vdb ext4 mount itself (~10ms, req=4–17). On warm boots this
+    // removes storage mount latency from the critical path entirely.
+    let storage_handle = if Path::new(STORAGE_DEVICE).exists() {
+        let _ = std::fs::create_dir_all(STORAGE_TEMP_MOUNT);
+        Some(std::thread::spawn(|| {
+            // Resize before mount — template may be smaller than device.
+            // Skip if filesystem already fills the device (subsequent boots).
+            // If resize fails (e.g. macOS-created template with incompatible features),
+            // skip mount — mount_storage_disk() will handle mkfs fallback.
+            if !ext4_already_full_size(STORAGE_DEVICE)
+                && !resize_ext4_if_needed(STORAGE_DEVICE, "storage")
+            {
+                boot_log(
+                    "WARN",
+                    "storage: resize failed, deferring to mount_storage_disk",
+                );
+                return false;
+            }
+
+            let dev = cstr(STORAGE_DEVICE);
+            let mnt = cstr(STORAGE_TEMP_MOUNT);
+            let ext4 = cstr("ext4");
+            // SAFETY: mount /dev/vda as ext4 at /mnt/storage with noatime
+            let mounted = unsafe {
+                libc::mount(
+                    dev.as_ptr(),
+                    mnt.as_ptr(),
+                    ext4.as_ptr(),
+                    libc::MS_NOATIME,
+                    std::ptr::null(),
+                ) == 0
+            };
+            if !mounted {
+                let err = std::io::Error::last_os_error();
+                boot_log(
+                    "WARN",
+                    &format!(
+                        "storage: parallel mount failed ({}), deferring to mount_storage_disk",
+                        err
+                    ),
+                );
+            }
+            mounted
+        }))
+    } else {
+        None
+    };
+
     // Resize ext4 on the UNMOUNTED device before mounting. The host copies
     // from a small template (~512MB) then extends the sparse file. resize2fs
     // on a mounted device fails with "Resource busy" — must resize first.
@@ -781,58 +854,20 @@ fn setup_persistent_rootfs() {
         } != 0
         {
             boot_log("ERROR", "failed to mount overlay disk after formatting");
+            // Clean up the parallel storage mount so mount_storage_disk() fallback
+            // does not hit EBUSY from an already-mounted /dev/vda.
+            if let Some(handle) = storage_handle {
+                if handle.join().unwrap_or(false) {
+                    let mnt = cstr(STORAGE_TEMP_MOUNT);
+                    // SAFETY: umount /mnt/storage that the parallel thread mounted
+                    unsafe {
+                        libc::umount(mnt.as_ptr());
+                    }
+                }
+            }
             return;
         }
     }
-
-    // Resize + mount storage disk in parallel while we set up overlayfs.
-    // The resize + ext4 mount of /dev/vda overlaps with overlayfs setup
-    // and overlay dir creation, saving that time from the critical path.
-    let storage_handle = if Path::new(STORAGE_DEVICE).exists() {
-        let _ = std::fs::create_dir_all(STORAGE_TEMP_MOUNT);
-        Some(std::thread::spawn(|| {
-            // Resize before mount — template may be smaller than device.
-            // Skip if filesystem already fills the device (subsequent boots).
-            // If resize fails (e.g. macOS-created template with incompatible features),
-            // skip mount — mount_storage_disk() will handle mkfs fallback.
-            if !ext4_already_full_size(STORAGE_DEVICE)
-                && !resize_ext4_if_needed(STORAGE_DEVICE, "storage")
-            {
-                boot_log(
-                    "WARN",
-                    "storage: resize failed, deferring to mount_storage_disk",
-                );
-                return false;
-            }
-
-            let dev = cstr(STORAGE_DEVICE);
-            let mnt = cstr(STORAGE_TEMP_MOUNT);
-            let ext4 = cstr("ext4");
-            // SAFETY: mount /dev/vda as ext4 at /mnt/storage with noatime
-            let mounted = unsafe {
-                libc::mount(
-                    dev.as_ptr(),
-                    mnt.as_ptr(),
-                    ext4.as_ptr(),
-                    libc::MS_NOATIME,
-                    std::ptr::null(),
-                ) == 0
-            };
-            if !mounted {
-                let err = std::io::Error::last_os_error();
-                boot_log(
-                    "WARN",
-                    &format!(
-                        "storage: parallel mount failed ({}), deferring to mount_storage_disk",
-                        err
-                    ),
-                );
-            }
-            mounted
-        }))
-    } else {
-        None
-    };
 
     // Create overlay directories
     let _ = std::fs::create_dir_all(format!("{}/upper", OVERLAY_MOUNT));
@@ -843,19 +878,17 @@ fn setup_persistent_rootfs() {
     let overlay_src = cstr("overlay");
     let newroot = cstr(NEWROOT);
     let overlay_type = cstr("overlay");
-    // index=on: enables the overlayfs index dir for stable file handle tracking across
-    //   copy-up operations (prevents stale handles after writes to lower-layer files).
-    // redirect_dir=on: enables redirect xattrs so cross-directory renames work correctly
-    //   on the upper layer without corrupting the lower layer view.
-    // uuid=on: stores a stable UUID in the upper dir for consistent inode numbering.
+    // Simple overlayfs without index/redirect_dir/uuid — these options trigger
+    // ext4 xattr writes + journal flushes on every mount. On macOS/HVF each
+    // ext4 journal flush (FUA/barrier) serializes to an APFS fsync (~10-30ms).
+    // With 15-30 flushes per mount, they add 200-900ms to every boot.
     //
-    // Note: these options do NOT enable Docker overlay2 stacking on the rootfs overlay.
-    // The rootfs overlay's lower layer is the initramfs (ramfs), which has no file-handle
-    // support. The kernel falls back to index=off for any overlay whose upper/work dir sits
-    // on this rootfs overlay, making it unusable as a Docker overlay2 upper dir regardless
-    // of these options. Docker's data root must be bind-mounted to ext4 (/storage/).
+    // These options also do NOT enable Docker overlay2 on this overlay — the
+    // lower layer is the initramfs (ramfs) which has no file-handle support,
+    // so the kernel falls back to index=off for any overlay2 upper dir on this
+    // root regardless. Docker's data root is on /storage/ (bare ext4), not here.
     let overlay_opts = cstr(&format!(
-        "index=on,redirect_dir=on,uuid=on,lowerdir=/,upperdir={}/upper,workdir={}/work",
+        "lowerdir=/,upperdir={}/upper,workdir={}/work",
         OVERLAY_MOUNT, OVERLAY_MOUNT
     ));
     // SAFETY: mount overlayfs with the specified options
@@ -5183,21 +5216,6 @@ mod tests {
         .unwrap();
 
         assert_eq!(resolved, merged.join("etc").join("hosts"));
-    }
-
-    /// Symmetric with `smolvm::data::consts::tests::host_guest_env_literals_are_stable`.
-    ///
-    /// The host declares `ENV_SMOLVM_GPU = "SMOLVM_GPU"` in
-    /// `src/data/consts.rs` and the agent redeclares the same literal
-    /// locally (the agent crate doesn't depend on the host crate).
-    /// Both tests pin the string; if either side is renamed alone,
-    /// its test fires and forces the other side to update in the
-    /// same change. Without the drift guard, a rename in the agent
-    /// would silently break the host→guest GPU-request signaling.
-    #[test]
-    fn host_guest_env_literals_are_stable() {
-        assert_eq!(ENV_SMOLVM_GPU, "SMOLVM_GPU");
-        assert_eq!(ENV_VALUE_ON, "1");
     }
 
     #[test]

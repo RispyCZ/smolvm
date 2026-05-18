@@ -9,10 +9,10 @@
 use crate::network::backend::{COMPAT_NET_FEATURES, TSI_FEATURE_HIJACK_INET};
 use crate::network::{plan_launch_network, EffectiveNetworkBackend};
 use smolvm_network::{
-    guest_env, start_virtio_network, GuestNetworkConfig, PortMapping as VirtioPortMapping,
+    start_virtio_network, GuestNetworkConfig, PortMapping as VirtioPortMapping,
     VirtioNetworkRuntime,
 };
-use smolvm_protocol::ports;
+use smolvm_protocol::{guest_env, ports};
 use std::ffi::CString;
 use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
@@ -372,6 +372,15 @@ pub fn launch_agent_vm_dynamic(
 
     if !config.mounts.is_empty() {
         if let Ok(cstr) = CString::new(format!("SMOLVM_MOUNT_COUNT={}", config.mounts.len())) {
+            env_strings.push(cstr);
+        }
+    }
+
+    // Tell the agent GPU was requested so it creates /dev/dri nodes and starts
+    // seatd after pivot_root. Keep this in sync with the normal launcher.
+    if config.resources.gpu {
+        let gpu_env = format!("{}={}", guest_env::GPU, guest_env::VALUE_ON);
+        if let Ok(cstr) = CString::new(gpu_env) {
             env_strings.push(cstr);
         }
     }

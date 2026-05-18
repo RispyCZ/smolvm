@@ -4,9 +4,7 @@
 //! All setup is done in the child process after fork, where
 //! DYLD_LIBRARY_PATH is still available for dlopen.
 
-use crate::data::consts::{
-    ENV_SMOLVM_GPU, ENV_SMOLVM_KRUN_LOG_LEVEL, ENV_SMOLVM_LIB_DIR, ENV_VALUE_ON,
-};
+use crate::data::consts::{ENV_SMOLVM_KRUN_LOG_LEVEL, ENV_SMOLVM_LIB_DIR};
 use crate::data::storage::HostMount;
 use crate::error::{Error, Result};
 use crate::network::backend::{COMPAT_NET_FEATURES, TSI_FEATURE_HIJACK_INET};
@@ -15,10 +13,10 @@ use crate::storage::{OverlayDisk, StorageDisk};
 use crate::util::{libkrun_filename, libkrunfw_filename};
 
 use smolvm_network::{
-    guest_env, start_virtio_network, GuestNetworkConfig, PortMapping as VirtioPortMapping,
+    start_virtio_network, GuestNetworkConfig, PortMapping as VirtioPortMapping,
     VirtioNetworkRuntime,
 };
-use smolvm_protocol::ports;
+use smolvm_protocol::{guest_env, ports};
 use std::ffi::CString;
 use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
@@ -29,6 +27,13 @@ use super::{KrunFunctions, PortMapping, VmResources};
 /// Protects the muxer's per-packet O(n) scan from unbounded growth when
 /// a host resolves to many IPs across many refresh cycles.
 const EGRESS_CIDR_CAP: usize = 512;
+
+/// Hidden benchmark knob for root virtiofs DAX.
+///
+/// Default behavior uses `krun_set_root`, which configures the root virtiofs
+/// device with libkrun's default DAX window. Set `SMOLVM_ROOTFS_DAX=0` to use
+/// `krun_add_virtiofs3("/dev/root", ..., shm_size=0, read_only=false)` instead.
+const ENV_SMOLVM_ROOTFS_DAX: &str = "SMOLVM_ROOTFS_DAX";
 
 /// The Arc type shared between the egress-refresh thread and libkrun's vsock muxer.
 type EgressArc = std::sync::Arc<std::sync::RwLock<Vec<(std::net::IpAddr, u8)>>>;
@@ -150,6 +155,20 @@ pub struct LaunchConfig<'a> {
 ///
 /// This function never returns on success.
 pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
+    let t0 = std::time::Instant::now();
+
+    // Emit boot timing to stderr (captured in the startup error log by the
+    // subprocess's stdio redirect) when INFO logging is enabled.
+    // tracing_subscriber writes to stdout by default, but the subprocess has
+    // stdout=/dev/null; stderr is the only channel that reaches the log file.
+    macro_rules! boot_timing {
+        ($label:expr) => {
+            if tracing::enabled!(tracing::Level::INFO) {
+                eprintln!("[boot] {:25} {}ms", $label, t0.elapsed().as_millis());
+            }
+        };
+    }
+
     let LaunchConfig {
         rootfs_path,
         disks,
@@ -179,6 +198,22 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
     })?;
     let krun =
         unsafe { KrunFunctions::load(&lib_dir) }.map_err(|e| Error::agent("load libkrun", e))?;
+    boot_timing!("dylib loaded");
+
+    // Pre-read the agent binary into the OS page cache so the virtiofs thread
+    // can serve the guest's first exec without waiting for disk I/O.
+    // Runs concurrently with krun context setup below — by the time
+    // krun_start_enter is called, the file is already in page cache.
+    {
+        let agent_bin = rootfs_path.join("usr/local/bin/smolvm-agent");
+        if agent_bin.exists() {
+            let _ = std::thread::Builder::new()
+                .name("agent-preread".into())
+                .spawn(move || {
+                    let _ = std::fs::read(&agent_bin);
+                });
+        }
+    }
 
     unsafe {
         let krun_set_log_level = krun.set_log_level;
@@ -193,6 +228,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         let krun_set_console_output = krun.set_console_output;
         let krun_set_port_map = krun.set_port_map;
         let krun_add_virtiofs = krun.add_virtiofs;
+        let krun_add_virtiofs3 = krun.add_virtiofs3;
         let krun_start_enter = krun.start_enter;
         let krun_disable_implicit_vsock = krun.disable_implicit_vsock;
         let krun_add_vsock = krun.add_vsock;
@@ -211,6 +247,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             return Err(Error::agent("create vm context", "krun_create_ctx failed"));
         }
         let ctx = ctx as u32;
+        boot_timing!("ctx created");
 
         // Set VM config
         if krun_set_vm_config(ctx, resources.cpus, resources.memory_mib) < 0 {
@@ -268,13 +305,36 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             };
         }
 
-        // Set root filesystem
+        // Set root filesystem.
+        //
+        // Default path: krun_set_root, preserving libkrun's established rootfs
+        // behavior and DAX defaults. Benchmark path: SMOLVM_ROOTFS_DAX=0 uses
+        // krun_add_virtiofs3 with shm_size=0, disabling the root DAX region
+        // while keeping the root read-write.
         let root = try_or_free_ctx!(
             path_to_cstring(rootfs_path),
             "set rootfs",
             "path contains null byte"
         );
-        if krun_set_root(ctx, root.as_ptr()) < 0 {
+        if rootfs_dax_disabled() {
+            let Some(add_virtiofs3) = krun_add_virtiofs3 else {
+                krun_free_ctx(ctx);
+                return Err(Error::agent(
+                    "set rootfs",
+                    "SMOLVM_ROOTFS_DAX=0 requires libkrun with krun_add_virtiofs3",
+                ));
+            };
+
+            let root_tag = cstr("/dev/root");
+            if add_virtiofs3(ctx, root_tag.as_ptr(), root.as_ptr(), 0, false) < 0 {
+                krun_free_ctx(ctx);
+                return Err(Error::agent(
+                    "set rootfs",
+                    "krun_add_virtiofs3 failed for root filesystem",
+                ));
+            }
+            tracing::info!("rootfs configured via virtiofs without DAX");
+        } else if krun_set_root(ctx, root.as_ptr()) < 0 {
             krun_free_ctx(ctx);
             return Err(Error::agent("set rootfs", "krun_set_root failed"));
         }
@@ -591,6 +651,8 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             }
         }
 
+        boot_timing!("devices configured");
+
         // Set working directory
         let workdir = cstr("/");
         krun_set_workdir(ctx, workdir.as_ptr());
@@ -638,7 +700,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         // "VM started" and discovers missing GPU only when their
         // workload hits a rendering call.
         if resources.gpu {
-            let gpu_env = format!("{}={}", ENV_SMOLVM_GPU, ENV_VALUE_ON);
+            let gpu_env = format!("{}={}", guest_env::GPU, guest_env::VALUE_ON);
             if let Ok(cs) = CString::new(gpu_env) {
                 env_strings.push(cs);
             }
@@ -773,6 +835,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         }
 
         // Start VM (this replaces the process on success)
+        boot_timing!("entering vm");
         let ret = krun_start_enter(ctx);
 
         // If we get here, something went wrong — free the context before returning
@@ -794,6 +857,17 @@ fn cstr(s: &str) -> CString {
 fn path_to_cstring(path: &Path) -> Result<CString> {
     CString::new(path.to_string_lossy().as_bytes())
         .map_err(|_| Error::agent("convert path", "path contains null byte"))
+}
+
+fn rootfs_dax_disabled() -> bool {
+    std::env::var(ENV_SMOLVM_ROOTFS_DAX)
+        .map(|value| {
+            matches!(
+                value.as_str(),
+                "0" | "false" | "False" | "FALSE" | "no" | "off"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn create_unix_stream_pair() -> std::io::Result<(RawFd, RawFd)> {

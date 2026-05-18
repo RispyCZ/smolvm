@@ -23,6 +23,7 @@ use smolvm::data::storage::HostMount;
 use smolvm::network::{validate_requested_network_backend, NetworkBackend};
 use smolvm::{DEFAULT_IDLE_CMD, DEFAULT_SHELL_CMD};
 use std::io::Write;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -59,6 +60,49 @@ fn resolve_egress_flags(
     };
 
     Ok((allow_cidr, net, dns_filter_hosts))
+}
+
+/// Spawn a detached `smolvm _cleanup-ephemeral` helper process so the parent
+/// CLI can exit immediately after flushing output.
+///
+/// Returns `true` if the helper was spawned successfully. The caller must then
+/// call `std::process::exit(exit_code)` without doing any further cleanup.
+///
+/// Returns `false` if spawn fails (binary not found, exec error, etc.).
+/// The caller falls back to synchronous cleanup in that case.
+fn try_spawn_detached_cleanup(
+    vm_name: &str,
+    pid: i32,
+    start_time: Option<u64>,
+    ephemeral_name: &str,
+) -> bool {
+    // Require a verified start time so the helper can use is_our_process_strict
+    // before sending SIGKILL. Without it, fall back to synchronous cleanup.
+    let start_time_val = match start_time {
+        Some(t) => t,
+        None => return false,
+    };
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    let result = std::process::Command::new(exe)
+        .arg("_cleanup-ephemeral")
+        .arg(vm_name)
+        .arg(pid.to_string())
+        .arg(start_time_val.to_string())
+        .arg(ephemeral_name)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        // New process group so the helper is immune to SIGHUP when the
+        // parent terminal closes. pgid = child pid.
+        .process_group(0)
+        .spawn();
+    // Drop the Child handle without waiting — we exit immediately after this.
+    // The OS will not create a zombie because the helper outlives us and its
+    // real parent (launchd/init) reaps it when it exits.
+    result.is_ok()
 }
 
 /// Manage machines
@@ -711,6 +755,14 @@ impl RunCmd {
                 };
 
                 // Ephemeral run — tear down VM and its data directory.
+                // Spawn a detached helper so the parent exits immediately after
+                // flushing output. Falls back to synchronous cleanup if spawn fails.
+                let (pid, start_time) = manager.pid_and_start_time().unwrap_or((0, None));
+                if pid > 0 && try_spawn_detached_cleanup(&vm_name, pid, start_time, &ephemeral_name)
+                {
+                    std::process::exit(exit_code);
+                }
+                // Fallback: synchronous cleanup (helper spawn failed).
                 vm_common::deregister_ephemeral_vm(&ephemeral_name);
                 manager.kill();
                 manager.cleanup_data_dir();
@@ -825,6 +877,14 @@ impl RunCmd {
                     exit_code
                 };
                 // Ephemeral run — tear down VM and its data directory.
+                // Spawn a detached helper so the parent exits immediately after
+                // flushing output. Falls back to synchronous cleanup if spawn fails.
+                let (pid, start_time) = manager.pid_and_start_time().unwrap_or((0, None));
+                if pid > 0 && try_spawn_detached_cleanup(&vm_name, pid, start_time, &ephemeral_name)
+                {
+                    std::process::exit(exit_code);
+                }
+                // Fallback: synchronous cleanup (helper spawn failed).
                 vm_common::deregister_ephemeral_vm(&ephemeral_name);
                 manager.kill();
                 manager.cleanup_data_dir();

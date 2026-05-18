@@ -34,6 +34,9 @@ pub struct KrunFunctions {
         unsafe extern "C" fn(u32, *const libc::c_char, *const libc::c_char, u32, bool) -> i32,
     pub add_vsock_port2: unsafe extern "C" fn(u32, u32, *const libc::c_char, bool) -> i32,
     pub add_virtiofs: unsafe extern "C" fn(u32, *const libc::c_char, *const libc::c_char) -> i32,
+    pub add_virtiofs3: Option<
+        unsafe extern "C" fn(u32, *const libc::c_char, *const libc::c_char, u64, bool) -> i32,
+    >,
     pub start_enter: unsafe extern "C" fn(u32) -> i32,
     pub disable_implicit_vsock: unsafe extern "C" fn(u32) -> i32,
     pub add_vsock: unsafe extern "C" fn(u32, u32) -> i32,
@@ -125,6 +128,7 @@ impl KrunFunctions {
             add_disk2: load_sym!(krun_add_disk2),
             add_vsock_port2: load_sym!(krun_add_vsock_port2),
             add_virtiofs: load_sym!(krun_add_virtiofs),
+            add_virtiofs3: load_optional_sym!("krun_add_virtiofs3"),
             start_enter: load_sym!(krun_start_enter),
             disable_implicit_vsock: load_sym!(krun_disable_implicit_vsock),
             add_vsock: load_sym!(krun_add_vsock),

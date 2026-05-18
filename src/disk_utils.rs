@@ -101,6 +101,44 @@ pub(crate) fn copy_disk_from_template<D: DiskType>(
             .open(disk_path)
             .map_err(|e| Error::storage("open for resize", e.to_string()))?;
         write_last_byte(&mut file, size_bytes, "seek for resize", "extend disk")?;
+        // Close before resize2fs — the tool reads the raw image from disk and
+        // will see stale data if the OS page cache hasn't been flushed yet.
+        drop(file);
+
+        // Expand the ext4 filesystem to fill the now-larger file on the host.
+        // This moves resize2fs off the guest boot path entirely.
+        // If resize2fs is unavailable or fails, the guest runs it instead.
+        if let Some(resize2fs) = find_e2fsprogs_tool("resize2fs") {
+            match std::process::Command::new(&resize2fs)
+                .arg(disk_path)
+                .output()
+            {
+                Ok(out) if out.status.success() => {
+                    tracing::info!(
+                        path = %disk_path.display(),
+                        disk_type = D::NAME,
+                        "host resize2fs succeeded — guest resize skipped on next boot"
+                    );
+                }
+                Ok(out) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    tracing::warn!(
+                        path = %disk_path.display(),
+                        disk_type = D::NAME,
+                        stderr = %stderr.trim(),
+                        "host resize2fs failed — guest will resize at boot"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = %disk_path.display(),
+                        disk_type = D::NAME,
+                        error = %e,
+                        "host resize2fs exec failed — guest will resize at boot"
+                    );
+                }
+            }
+        }
     }
 
     tracing::info!(

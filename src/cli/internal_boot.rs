@@ -15,10 +15,7 @@ use std::path::PathBuf;
 /// Reads the boot config from the given path, sets up libkrun, and calls
 /// `krun_start_enter` which blocks forever (or until the VM exits).
 pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
-    // Become a session leader (detach from parent's terminal session)
-    unsafe {
-        libc::setsid();
-    }
+    let t_proc = std::time::Instant::now();
 
     // Read boot config
     let config_data = std::fs::read(&config_path)
@@ -65,16 +62,28 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
         smolvm::process::exit_child(1);
     }
 
-    // Close ALL inherited file descriptors from the parent (server).
+    // Close inherited file descriptors from the parent (server).
     // Without this, the subprocess holds database locks, network sockets, etc.
     // that can interfere with libkrun's operation. Keep stdin/stdout/stderr (0-2)
     // which now point to /dev/null.
-    unsafe {
-        let max_fd = libc::getdtablesize();
-        for fd in 3..max_fd {
-            libc::close(fd);
-        }
+    smolvm::process::close_inherited_fds_from(3);
+
+    // Emit subprocess startup timing to the startup error log (stderr after
+    // the stdio redirect above). These lines decompose the dark window between
+    // parent's spawn() returning and launch_agent_vm() being called.
+    // Emit when RUST_LOG contains "info" — check env var directly since the
+    // tracing dispatch may be unusable after close_inherited_fds_from invalidates
+    // macOS framework file descriptors held by the parent process.
+    let rust_log = std::env::var("RUST_LOG").unwrap_or_default();
+    let proc_timing_on = rust_log.contains("info");
+    macro_rules! proc_timing {
+        ($label:expr) => {
+            if proc_timing_on {
+                eprintln!("[proc] {:25} {}ms", $label, t_proc.elapsed().as_millis());
+            }
+        };
     }
+    proc_timing!("fds closed");
 
     // Open storage and overlay disks
     let storage_disk = match smolvm::storage::StorageDisk::open_or_create_at(
@@ -90,6 +99,7 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
             smolvm::process::exit_child(1);
         }
     };
+    proc_timing!("storage opened");
 
     let overlay_disk = match smolvm::storage::OverlayDisk::open_or_create_at(
         &config.overlay_disk_path,
@@ -104,6 +114,7 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
             smolvm::process::exit_child(1);
         }
     };
+    proc_timing!("overlay opened");
 
     // Launch the VM (never returns on success)
     let disks = VmDisks {
@@ -131,6 +142,8 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
     } else {
         None
     };
+
+    proc_timing!("ready to launch");
 
     let result = launch_agent_vm(&LaunchConfig {
         rootfs_path: &config.rootfs_path,

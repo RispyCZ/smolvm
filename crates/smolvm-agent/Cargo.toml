@@ -10,7 +10,6 @@ name = "smolvm-agent"
 path = "src/main.rs"
 
 [dependencies]
-smolvm-network = { path = "../smolvm-network" }
 smolvm-protocol = { path = "../smolvm-protocol" }
 serde = { workspace = true }
 serde_json = { workspace = true }
