@@ -32,6 +32,24 @@ use std::time::Duration;
 ///
 /// Resolution failure for `--allow-host` is a hard error — a typo or DNS outage
 /// should not silently weaken the security policy.
+/// Returns true when `s` structurally looks like an OCI image reference
+/// rather than an executable name or path.
+///
+/// Catches the common mistake of writing `smolvm machine run ubuntu:22.04 --
+/// bash` instead of `smolvm machine run --image ubuntu:22.04 -- bash`.
+/// Only unambiguous structural signals are checked:
+///   - `image:tag` form — colons are not valid in executable names
+///   - `registry/image` or `namespace/image` form (non-absolute slash path)
+///
+/// Bare names like `alpine` or `nginx` are intentionally not flagged here
+/// because they are indistinguishable from valid bare commands.
+fn is_likely_image_ref(s: &str) -> bool {
+    if s.contains(':') {
+        return true;
+    }
+    s.contains('/') && !s.starts_with('/') && !s.starts_with("./") && !s.starts_with("../")
+}
+
 fn resolve_egress_flags(
     mut allow_cidr: Vec<String>,
     allow_host: Vec<String>,
@@ -453,6 +471,40 @@ impl RunCmd {
             (self.interactive, self.tty)
         };
 
+        // Detect the common mistake of passing an image reference as a positional
+        // argument instead of using --image.  clap's trailing_var_arg captures any
+        // positional before "--" into `command`, so `smolvm machine run ubuntu:22.04
+        // -- bash` silently puts "ubuntu:22.04" into command[0] and fails with a
+        // confusing ENOENT after the VM boots.  Catching the unambiguous cases
+        // (image:tag, registry/image) here avoids an unnecessary boot round-trip.
+        {
+            let resolved_image = self.image.as_deref().or(params.image.as_deref());
+            if resolved_image.is_none() && !self.command.is_empty() {
+                if is_likely_image_ref(&self.command[0]) {
+                    let cmd0 = &self.command[0];
+                    // Strip the "--" separator that trailing_var_arg includes
+                    // in the vec so the suggestion doesn't show a double "--".
+                    let rest: Vec<&str> = self.command[1..]
+                        .iter()
+                        .filter(|s| s.as_str() != "--")
+                        .map(|s| s.as_str())
+                        .collect();
+                    let suggestion = if rest.is_empty() {
+                        format!("smolvm machine run --image {cmd0}")
+                    } else {
+                        format!("smolvm machine run --image {cmd0} -- {}", rest.join(" "))
+                    };
+                    return Err(Error::config(
+                        "machine run",
+                        format!(
+                            "'{cmd0}' looks like a container image reference, not a command.\n\
+                             To run a container, use --image:\n  {suggestion}"
+                        ),
+                    ));
+                }
+            }
+        }
+
         let resources = VmResources {
             cpus: params.cpus,
             memory_mib: params.mem,
@@ -865,8 +917,33 @@ impl RunCmd {
                         tty,
                     )?
                 } else {
+                    // Capture for error context before command is moved into vm_exec.
+                    let cmd0 = command.first().cloned().unwrap_or_default();
                     let (exit_code, stdout, stderr) =
-                        client.vm_exec(command, env, params.workdir.clone(), self.timeout)?;
+                        client.vm_exec(command, env, params.workdir.clone(), self.timeout)
+                        .map_err(|e| {
+                            // In bare VM mode a spawn ENOENT often means the user
+                            // forgot --image and passed the image name as a positional.
+                            // Name the command that wasn't found so the hint is actionable.
+                            let msg = e.to_string();
+                            if image.is_none()
+                                && (msg.contains("No such file or directory")
+                                    || msg.contains("os error 2"))
+                                && !cmd0.starts_with('/')
+                                && !cmd0.starts_with('.')
+                            {
+                                Error::agent(
+                                    "vm exec",
+                                    format!(
+                                        "{msg}\n\nNote: '{cmd0}' was not found in the VM. \
+                                         If you meant to run a container image, use --image:\n  \
+                                         smolvm machine run --image {cmd0} -- <command>"
+                                    ),
+                                )
+                            } else {
+                                e
+                            }
+                        })?;
                     if !stdout.is_empty() {
                         let _ = std::io::stdout().write_all(&stdout);
                     }
@@ -917,6 +994,40 @@ mod tests {
         };
         assert_eq!(cmd.name, Some("foo".to_string()));
         assert!(cmd.detach);
+    }
+
+    // Documents the clap parsing behaviour: positionals before "--" land in
+    // `command`, not `image`.  is_likely_image_ref() catches the unambiguous
+    // cases before a VM is booted.
+    #[test]
+    fn run_image_ref_as_positional_lands_in_command_vec() {
+        let cli = TestMachineCli::parse_from([
+            "machine", "run", "ubuntu:22.04", "--", "bash",
+        ]);
+        let MachineCmd::Run(cmd) = cli.command else {
+            panic!("expected machine run command");
+        };
+        assert_eq!(cmd.image, None);
+        // With trailing_var_arg, clap includes the "--" separator in the vec.
+        assert_eq!(cmd.command, ["ubuntu:22.04", "--", "bash"]);
+        // is_likely_image_ref catches this before the VM starts
+        assert!(is_likely_image_ref(&cmd.command[0]));
+    }
+
+    #[test]
+    fn is_likely_image_ref_classifies_correctly() {
+        // Unambiguous image references
+        assert!(is_likely_image_ref("ubuntu:22.04")); // image:tag
+        assert!(is_likely_image_ref("ghcr.io/org/image")); // registry/path
+        assert!(is_likely_image_ref("library/alpine")); // namespace/image
+
+        // Bare names are not flagged — indistinguishable from commands at parse time
+        assert!(!is_likely_image_ref("alpine"));
+        assert!(!is_likely_image_ref("bash"));
+
+        // Absolute and relative paths are always commands
+        assert!(!is_likely_image_ref("/bin/sh"));
+        assert!(!is_likely_image_ref("./script.sh"));
     }
 }
 
