@@ -92,6 +92,11 @@ pub(crate) fn copy_disk_from_template<D: DiskType>(
 
     clone_or_copy_file(template_path, disk_path)?;
 
+    // Extend the sparse file to the target size. The ext4 filesystem inside
+    // is still at the template's original size — the guest agent expands it
+    // at boot via resize2fs in a parallel thread (~10ms, non-blocking).
+    // We do NOT run resize2fs on the host: it takes ~880ms to expand the
+    // filesystem metadata synchronously, blocking the entire boot path.
     let current_size = std::fs::metadata(disk_path)
         .map_err(|e| Error::storage("read copied disk metadata", e.to_string()))?
         .len();
@@ -101,44 +106,6 @@ pub(crate) fn copy_disk_from_template<D: DiskType>(
             .open(disk_path)
             .map_err(|e| Error::storage("open for resize", e.to_string()))?;
         write_last_byte(&mut file, size_bytes, "seek for resize", "extend disk")?;
-        // Close before resize2fs — the tool reads the raw image from disk and
-        // will see stale data if the OS page cache hasn't been flushed yet.
-        drop(file);
-
-        // Expand the ext4 filesystem to fill the now-larger file on the host.
-        // This moves resize2fs off the guest boot path entirely.
-        // If resize2fs is unavailable or fails, the guest runs it instead.
-        if let Some(resize2fs) = find_e2fsprogs_tool("resize2fs") {
-            match std::process::Command::new(&resize2fs)
-                .arg(disk_path)
-                .output()
-            {
-                Ok(out) if out.status.success() => {
-                    tracing::info!(
-                        path = %disk_path.display(),
-                        disk_type = D::NAME,
-                        "host resize2fs succeeded — guest resize skipped on next boot"
-                    );
-                }
-                Ok(out) => {
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    tracing::warn!(
-                        path = %disk_path.display(),
-                        disk_type = D::NAME,
-                        stderr = %stderr.trim(),
-                        "host resize2fs failed — guest will resize at boot"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        path = %disk_path.display(),
-                        disk_type = D::NAME,
-                        error = %e,
-                        "host resize2fs exec failed — guest will resize at boot"
-                    );
-                }
-            }
-        }
     }
 
     tracing::info!(
@@ -298,8 +265,13 @@ pub(crate) fn write_last_byte(
 
 /// Clone a file using the platform-optimal copy method.
 ///
-/// - macOS: `clonefile()` for instant APFS copy-on-write (falls back to `fs::copy`)
-/// - Linux: `fs::copy` (uses `copy_file_range` for sparse-aware copy)
+/// - macOS: `clonefile()` for instant APFS copy-on-write
+/// - Linux: sparse copy via `SEEK_HOLE`/`SEEK_DATA` (copies only data regions)
+/// - Fallback: `fs::copy`
+///
+/// Disk templates are sparse files (~500KB actual data in a 512MB logical file).
+/// `std::fs::copy()` copies all bytes including zero regions. The sparse copy
+/// path skips holes, reducing copy time from ~400ms to ~5ms.
 pub(crate) fn clone_or_copy_file(src: &Path, dst: &Path) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
@@ -327,6 +299,84 @@ pub(crate) fn clone_or_copy_file(src: &Path, dst: &Path) -> Result<()> {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    {
+        match sparse_copy(src, dst) {
+            Ok(bytes) => {
+                tracing::debug!(
+                    src = %src.display(), dst = %dst.display(),
+                    bytes_copied = bytes, "sparse copy succeeded"
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                tracing::debug!(src = %src.display(), error = %e, "sparse copy failed, falling back");
+            }
+        }
+    }
+
     std::fs::copy(src, dst).map_err(|e| Error::storage("copy file", e.to_string()))?;
     Ok(())
+}
+
+/// Copy only data regions of a sparse file via SEEK_HOLE/SEEK_DATA.
+#[cfg(target_os = "linux")]
+fn sparse_copy(src: &Path, dst: &Path) -> std::io::Result<u64> {
+    use std::os::unix::io::AsRawFd;
+
+    let src_file = std::fs::File::open(src)?;
+    let src_len = src_file.metadata()?.len();
+    if src_len == 0 {
+        std::fs::File::create(dst)?;
+        return Ok(0);
+    }
+
+    let dst_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(dst)?;
+    dst_file.set_len(src_len)?;
+
+    let src_fd = src_file.as_raw_fd();
+    let dst_fd = dst_file.as_raw_fd();
+    let mut total: u64 = 0;
+    let mut offset: i64 = 0;
+    let mut buf = vec![0u8; 256 * 1024];
+
+    loop {
+        let data_start = unsafe { libc::lseek(src_fd, offset, libc::SEEK_DATA) };
+        if data_start < 0 {
+            if std::io::Error::last_os_error().raw_os_error() == Some(libc::ENXIO) {
+                break;
+            }
+            return Err(std::io::Error::last_os_error());
+        }
+        let hole_start = unsafe { libc::lseek(src_fd, data_start, libc::SEEK_HOLE) };
+        let data_end = if hole_start < 0 {
+            src_len as i64
+        } else {
+            hole_start
+        };
+
+        let mut pos = data_start;
+        while pos < data_end {
+            let to_read = std::cmp::min((data_end - pos) as usize, buf.len());
+            let n =
+                unsafe { libc::pread(src_fd, buf.as_mut_ptr() as *mut libc::c_void, to_read, pos) };
+            if n <= 0 {
+                break;
+            }
+            let written = unsafe {
+                libc::pwrite(dst_fd, buf.as_ptr() as *const libc::c_void, n as usize, pos)
+            };
+            if written <= 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            pos += n as i64;
+            total += n as u64;
+        }
+        offset = data_end;
+    }
+    Ok(total)
 }
