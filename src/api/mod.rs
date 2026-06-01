@@ -20,6 +20,7 @@
 
 #[path = "errors.rs"]
 pub mod error;
+pub mod auth;
 pub mod handlers;
 pub mod state;
 pub mod supervisor;
@@ -43,6 +44,7 @@ use tower_http::{
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
+use self::auth::JwtConfig;
 use self::error::ApiError;
 use state::ApiState;
 
@@ -137,7 +139,15 @@ pub fn validate_command(cmd: &[String]) -> Result<(), ApiError> {
 ///
 /// `cors_origins` specifies allowed CORS origins. If empty, defaults to
 /// localhost:8080 and localhost:3000 (both http and 127.0.0.1 variants).
-pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router {
+///
+/// When `jwt` is `Some`, every `/api/v1/*` request must carry a bearer token
+/// signed by a key from the configured JWKS endpoint. `/health`, `/metrics`,
+/// and `/swagger-ui` remain unauthenticated regardless.
+pub fn create_router(
+    state: Arc<ApiState>,
+    cors_origins: Vec<String>,
+    jwt: Option<Arc<JwtConfig>>,
+) -> Router {
     // Health check route
     let health_route = Router::new().route("/health", get(handlers::health::health));
 
@@ -175,6 +185,11 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
 
     // API v1 routes
     let api_v1 = Router::new().nest("/machines", machine_routes);
+    let api_v1 = if let Some(cfg) = jwt {
+        api_v1.layer(middleware::from_fn_with_state(cfg, auth::jwt_middleware))
+    } else {
+        api_v1
+    };
 
     // CORS: Use configured origins, or default to localhost for security.
     let default_origins = || {

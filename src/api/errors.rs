@@ -1,7 +1,7 @@
 //! API error types with HTTP status mapping.
 
 use axum::{
-    http::StatusCode,
+    http::{header, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -19,6 +19,8 @@ pub enum ApiError {
     BadRequest(String),
     /// Request timeout (408).
     Timeout,
+    /// Authentication required or token invalid (401).
+    Unauthorized(String),
     /// Internal server error (500).
     Internal(String),
 }
@@ -44,6 +46,7 @@ struct ErrorResponse {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        let mut www_authenticate: Option<HeaderValue> = None;
         let (status, code, message) = match self {
             ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, "NOT_FOUND", msg),
             ApiError::Conflict(msg) => (StatusCode::CONFLICT, "CONFLICT", msg),
@@ -53,6 +56,12 @@ impl IntoResponse for ApiError {
                 "TIMEOUT",
                 "request timed out".to_string(),
             ),
+            ApiError::Unauthorized(msg) => {
+                www_authenticate = Some(HeaderValue::from_static(
+                    r#"Bearer error="invalid_token""#,
+                ));
+                (StatusCode::UNAUTHORIZED, "UNAUTHORIZED", msg)
+            }
             ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", msg),
         };
 
@@ -61,7 +70,11 @@ impl IntoResponse for ApiError {
             code,
         });
 
-        (status, body).into_response()
+        let mut response = (status, body).into_response();
+        if let Some(value) = www_authenticate {
+            response.headers_mut().insert(header::WWW_AUTHENTICATE, value);
+        }
+        response
     }
 }
 
@@ -120,6 +133,10 @@ mod tests {
             (ApiError::BadRequest("x".into()), StatusCode::BAD_REQUEST),
             (ApiError::Timeout, StatusCode::REQUEST_TIMEOUT),
             (
+                ApiError::Unauthorized("x".into()),
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
                 ApiError::Internal("x".into()),
                 StatusCode::INTERNAL_SERVER_ERROR,
             ),
@@ -127,6 +144,17 @@ mod tests {
         for (error, expected) in cases {
             assert_eq!(error.into_response().status(), expected);
         }
+    }
+
+    #[test]
+    fn unauthorized_sets_www_authenticate() {
+        let response = ApiError::Unauthorized("bad token".into()).into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let value = response
+            .headers()
+            .get(axum::http::header::WWW_AUTHENTICATE)
+            .expect("WWW-Authenticate header missing");
+        assert!(value.to_str().unwrap().starts_with("Bearer"));
     }
 
     #[test]

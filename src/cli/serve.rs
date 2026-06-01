@@ -29,11 +29,19 @@ API ENDPOINTS:
   POST   /api/v1/machines/:id/exec    Execute command
   DELETE /api/v1/machines/:id         Delete machine
 
+AUTHENTICATION:
+  By default the API has no authentication. Pass --jwt-jwks-url to require a
+  bearer JWT signed by a key from the given JWKS endpoint on every /api/v1/*
+  request. /health, /metrics, and /swagger-ui remain public.
+
 EXAMPLES:
   smolvm serve start                                Listen on the default Unix socket (unix:///$XDG_RUNTIME_DIR/smolvm.sock)
   smolvm serve start -l 0.0.0.0:9000                Listen on all interfaces, port 9000
   smolvm serve start -l unix:///tmp/smol.sock       Listen on a Unix domain socket
-  smolvm serve start -v                             Enable verbose logging")]
+  smolvm serve start -v                             Enable verbose logging
+  smolvm serve start --jwt-jwks-url https://issuer.example/.well-known/jwks.json \\
+                    --jwt-issuer https://issuer.example --jwt-audience smolvm
+                                                    Require valid OIDC bearer tokens")]
     Start(ServeStartCmd),
 
     /// Export OpenAPI specification for SDK generation
@@ -71,6 +79,30 @@ pub struct ServeStartCmd {
     /// Output logs as structured JSON (for log aggregators)
     #[arg(long)]
     json_logs: bool,
+
+    /// JWKS URL for validating bearer JWTs on /api/v1/*. Setting this enables
+    /// authentication; leaving it unset preserves the existing behavior of
+    /// no auth.
+    #[arg(long, value_name = "URL")]
+    jwt_jwks_url: Option<String>,
+
+    /// Required `iss` claim value (only checked when --jwt-jwks-url is set).
+    #[arg(long, value_name = "ISS", requires = "jwt_jwks_url")]
+    jwt_issuer: Option<String>,
+
+    /// Required `aud` claim value (repeatable; only checked when
+    /// --jwt-jwks-url is set).
+    #[arg(long = "jwt-audience", value_name = "AUD", requires = "jwt_jwks_url")]
+    jwt_audiences: Vec<String>,
+
+    /// JWKS cache TTL in seconds (default 600).
+    #[arg(
+        long,
+        value_name = "SECS",
+        default_value_t = 600,
+        requires = "jwt_jwks_url"
+    )]
+    jwt_cache_ttl_secs: u64,
 }
 
 impl ServeStartCmd {
@@ -101,8 +133,22 @@ impl ServeStartCmd {
     }
 
     async fn run_server(self, listen_target: ListenTarget) -> Result<()> {
+        let jwt_config = if let Some(url) = self.jwt_jwks_url.as_deref() {
+            let cfg = smolvm::api::auth::JwtConfig::new(
+                url,
+                self.jwt_issuer.clone(),
+                self.jwt_audiences.clone(),
+                std::time::Duration::from_secs(self.jwt_cache_ttl_secs),
+            )
+            .map_err(|e| smolvm::error::Error::config("configure JWT validation", e))?;
+            println!("JWT validation enabled (JWKS: {})", cfg.jwks_url());
+            Some(cfg)
+        } else {
+            None
+        };
+
         if let ListenTarget::Tcp(addr) = &listen_target {
-            if addr.ip().is_unspecified() {
+            if addr.ip().is_unspecified() && jwt_config.is_none() {
                 eprintln!(
                     "WARNING: Server is listening on all interfaces ({}).",
                     addr.ip()
@@ -143,7 +189,7 @@ impl ServeStartCmd {
         });
 
         // Create router
-        let app = smolvm::api::create_router(state, self.cors_origins.clone());
+        let app = smolvm::api::create_router(state, self.cors_origins.clone(), jwt_config);
 
         // Listen server on TCP or Unix socket
         match listen_target {
