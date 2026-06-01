@@ -97,11 +97,12 @@ impl SmolvmDb {
     /// Open the database at the default location.
     ///
     /// Default path: `~/Library/Application Support/smolvm/server/smolvm.db` (macOS)
-    /// or `~/.local/share/smolvm/server/smolvm.db` (Linux)
+    /// or `~/.local/share/smolvm/server/smolvm.db` (Linux), unless
+    /// `SMOLVM_DB_DIR` overrides the parent directory.
     ///
     /// If the database doesn't exist, it will be created.
     pub fn open() -> Result<Self> {
-        let path = Self::default_path()?;
+        let path = Self::resolved_path()?;
         Self::open_at(&path)
     }
 
@@ -118,12 +119,27 @@ impl SmolvmDb {
         })
     }
 
-    /// Get the default database path.
+    /// Default database path under `dirs::data_local_dir()`. No env consulted.
     pub fn default_path() -> Result<PathBuf> {
         let data_dir = dirs::data_local_dir().ok_or_else(|| {
             Error::database_unavailable("could not determine local data directory")
         })?;
         Ok(data_dir.join("smolvm").join("server").join("smolvm.db"))
+    }
+
+    /// Resolved database path: `SMOLVM_DB_DIR` if set (DB file is always
+    /// `smolvm.db` inside it), else [`Self::default_path`].
+    ///
+    /// Used by jailer-style sandboxes that put the writable DB on a
+    /// separate mount from the read-only data dir.
+    pub fn resolved_path() -> Result<PathBuf> {
+        if let Some(dir) = std::env::var("SMOLVM_DB_DIR")
+            .ok()
+            .filter(|s| !s.is_empty())
+        {
+            return Ok(PathBuf::from(dir).join("smolvm.db"));
+        }
+        Self::default_path()
     }
 
     /// Initialize database tables.

@@ -385,14 +385,35 @@ fn resolve_cache_asset_path(
 /// Marker file indicating extraction is complete.
 const EXTRACTION_MARKER: &str = ".smolvm-extracted";
 
+/// Default parent directory for the `smolvm-pack` and `smolvm-libs`
+/// caches: `dirs::cache_dir()`. No env consulted.
+pub fn cache_root_default() -> std::io::Result<PathBuf> {
+    dirs::cache_dir()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no cache directory"))
+}
+
+/// Resolved parent directory for the `smolvm-pack` and `smolvm-libs`
+/// caches: `SMOLVM_PACK_CACHE_DIR` if set, else [`cache_root_default`].
+///
+/// Used by jailer-style sandboxes that mount the pack cache on a
+/// separate writable volume.
+pub fn cache_root() -> std::io::Result<PathBuf> {
+    if let Some(dir) = std::env::var("SMOLVM_PACK_CACHE_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
+        return Ok(PathBuf::from(dir));
+    }
+    cache_root_default()
+}
+
 /// Get the cache directory for a given checksum.
 ///
-/// Returns `~/.cache/smolvm-pack/<checksum>/` (hex-formatted).
+/// Returns `<cache_root>/smolvm-pack/<checksum>/` (hex-formatted).
 pub fn get_cache_dir(checksum: u32) -> std::io::Result<PathBuf> {
-    let base = dirs::cache_dir()
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no cache directory"))?;
-
-    Ok(base.join("smolvm-pack").join(format!("{:08x}", checksum)))
+    Ok(cache_root()?
+        .join("smolvm-pack")
+        .join(format!("{:08x}", checksum)))
 }
 
 /// Check if assets have already been extracted.
@@ -1196,8 +1217,7 @@ pub fn extract_libs_from_binary(exe_path: &Path, debug: bool) -> std::io::Result
     }
     let libs_checksum = hasher.finalize();
 
-    let cache_base = dirs::cache_dir()
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no cache directory"))?;
+    let cache_base = cache_root()?;
     let libs_cache_dir = cache_base
         .join("smolvm-libs")
         .join(format!("{:08x}", libs_checksum));

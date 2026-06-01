@@ -17,13 +17,30 @@ pub struct BlobCache {
 }
 
 impl BlobCache {
-    /// Open or create a cache at the default location.
-    pub fn open_default() -> std::io::Result<Self> {
-        let cache_dir = dirs::cache_dir()
+    /// Default registry cache root: `<cache_dir>/smolvm-registry`. No env consulted.
+    fn default_root() -> std::io::Result<PathBuf> {
+        Ok(dirs::cache_dir()
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no cache dir"))?
-            .join("smolvm-registry")
-            .join("blobs");
-        Self::open(cache_dir, DEFAULT_MAX_SIZE)
+            .join("smolvm-registry"))
+    }
+
+    /// Resolved registry cache root: `SMOLVM_REGISTRY_CACHE_DIR` if set,
+    /// else [`Self::default_root`].
+    fn resolved_root() -> std::io::Result<PathBuf> {
+        if let Some(dir) = std::env::var("SMOLVM_REGISTRY_CACHE_DIR")
+            .ok()
+            .filter(|s| !s.is_empty())
+        {
+            return Ok(PathBuf::from(dir));
+        }
+        Self::default_root()
+    }
+
+    /// Open or create a cache at the default location (`blobs/` subdir of
+    /// the resolved root). Used by jailer-style sandboxes that put the
+    /// registry cache on a dedicated writable mount.
+    pub fn open_default() -> std::io::Result<Self> {
+        Self::open(Self::resolved_root()?.join("blobs"), DEFAULT_MAX_SIZE)
     }
 
     /// Open or create a cache at a specific path with a size limit.
